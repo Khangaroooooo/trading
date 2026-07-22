@@ -1,0 +1,266 @@
+"""Experiment R23 — Formally test w=95%/100% (top-2 sleeve + SPY) under R22's
+corrected, direction-aware CAGR bar.
+
+Rules (locked before running; see Evervault
+research/finance/backtests/results/r23-top2-blend-w95-100-corrected-bar.md for full spec).
+
+Sleeve A = R8/R20/R22 exact spec (11 SPDR sectors, top-2 abs-momentum vs BIL, monthly
+rebal, 5bps/side, no vol-target overlay). Sleeve B = SPY B&H, same monthly grid.
+Blended at fixed weights w in {75, 95, 100}%, monthly rebalance back to target weight,
+with a blend-level rebalancing cost (SPY-leg-only, 5bps/side) applied to the weight
+drift between sleeves each month, identical methodology to R18/R20/R22. Sleeve A's own
+internal trading costs are already embedded in its monthly returns. w=75% is a sanity
+anchor only (must reproduce R20/R22's published numbers); w=95%/100% are the two
+pre-declared test points.
+
+Pure stdlib, reads the existing cached data/cache/closes.csv (same cache as
+R1/R3/R5/R8/R10/R11/R16/R18/R20/R22) -- no new fetch, no installs.
+
+Run: cd ~/Documents/trading && python3 backtest_sleeve_blend_r23.py
+"""
+import csv
+import os
+import statistics
+from datetime import date as Date
+
+SECTORS = ["XLK", "XLF", "XLV", "XLE", "XLI", "XLP", "XLY", "XLU", "XLB", "XLRE", "XLC"]
+ALL = SECTORS + ["SPY", "BIL"]
+COST_PER_SIDE = 0.0005
+TOP_N = 2
+LOOKBACK_M = 12
+CACHE = os.path.join(os.path.dirname(__file__) or ".", "data", "cache", "closes.csv")
+
+BLEND_WEIGHTS = [0.75, 0.95, 1.00]
+
+
+def load_closes():
+    if not os.path.exists(CACHE):
+        raise SystemExit(f"Cache missing at {CACHE} — expected R1/R3/R5/R8/R10/R18 cache to "
+                          "already exist; not pulling new data for this experiment.")
+    with open(CACHE, newline="") as f:
+        reader = csv.reader(f)
+        header = next(reader)
+        cols = header[1:]
+        data = {}
+        for row in reader:
+            if not row:
+                continue
+            d = Date.fromisoformat(row[0][:10])
+            prices = {}
+            for sym, val in zip(cols, row[1:]):
+                if val != "":
+                    prices[sym] = float(val)
+            data[d] = prices
+    dates = sorted(data.keys())
+    return dates, data
+
+
+def resample_month_end(dates, data, symbols):
+    buckets = {}
+    for d in dates:
+        buckets[(d.year, d.month)] = d
+    labels = [buckets[k] for k in sorted(buckets.keys())]
+    series = {sym: [data[d].get(sym) for d in labels] for sym in symbols}
+    return labels, series
+
+
+def pct_change(vals):
+    out = [None]
+    for i in range(1, len(vals)):
+        a, b = vals[i - 1], vals[i]
+        out.append((b / a - 1) if (a is not None and b is not None and a != 0) else None)
+    return out
+
+
+def momentum_12m(vals, lookback):
+    n = len(vals)
+    out = [None] * n
+    for i in range(n):
+        j = i - lookback
+        if j < 0:
+            continue
+        a, b = vals[j], vals[i]
+        if a is not None and b is not None and a != 0:
+            out[i] = b / a - 1
+    return out
+
+
+def base_weights(sig_t, bil_t, top_n):
+    top = sorted(sig_t.items(), key=lambda kv: -kv[1])[:top_n]
+    w = {}
+    for sym, val in top:
+        tgt = sym if (bil_t is not None and val > bil_t) else "BIL"
+        w[tgt] = w.get(tgt, 0) + 1 / top_n
+    return w
+
+
+def run_sleeve_a(labels, r1m, sig):
+    """R8: top-2 abs-momentum rotation book, no vol-target overlay."""
+    start_i = LOOKBACK_M
+    prev = {}
+    port_ret = []
+    for i in range(start_i, len(labels) - 1):
+        t1 = labels[i + 1]
+        sig_t = {s: sig[s][i] for s in SECTORS if sig[s][i] is not None}
+        if len(sig_t) < TOP_N:
+            continue
+        bil = sig["BIL"][i]
+        w = base_weights(sig_t, bil, TOP_N)
+
+        traded = sum(abs(w.get(s, 0) - prev.get(s, 0)) for s in (set(w) | set(prev)))
+        cost = traded * COST_PER_SIDE
+        gross = 0.0
+        for s, wt in w.items():
+            rv = r1m[s][i + 1]
+            gross += wt * (rv if rv is not None else 0.0)
+        port_ret.append((t1, gross - cost))
+        prev = w
+    return port_ret
+
+
+def run_blend(sleeve_a_ret, sleeve_b_ret, w):
+    """Fixed-mix blend of two monthly return streams, rebalanced back to w each month,
+    with a blend-level rebalancing cost on the drift (SPY-leg-only, 5bps/side)."""
+    assert [d for d, _ in sleeve_a_ret] == [d for d, _ in sleeve_b_ret]
+    out = []
+    for (t, ra), (_, rb) in zip(sleeve_a_ret, sleeve_b_ret):
+        gross = w * ra + (1 - w) * rb
+        wa_post = (w * (1 + ra)) / (w * (1 + ra) + (1 - w) * (1 + rb)) if (w > 0 or (1 - w) > 0) else w
+        drift = abs(wa_post - w)
+        rebal_cost = drift * 2 * COST_PER_SIDE
+        out.append((t, gross - rebal_cost))
+    return out
+
+
+def metrics(returns_by_date, periods_per_year=12):
+    dates = [d for d, _ in returns_by_date]
+    rets = [r for _, r in returns_by_date]
+    eq = []
+    acc = 1.0
+    for r in rets:
+        acc *= (1 + r)
+        eq.append(acc)
+    n = len(rets)
+    years = n / periods_per_year
+    cagr = eq[-1] ** (1 / years) - 1
+    vol = statistics.stdev(rets) * (periods_per_year ** 0.5)
+    mean = statistics.mean(rets)
+    sharpe = mean / statistics.stdev(rets) * (periods_per_year ** 0.5)
+    neg = [r for r in rets if r < 0]
+    downside = statistics.stdev(neg) * (periods_per_year ** 0.5) if len(neg) > 1 else float("nan")
+    sortino = (mean * periods_per_year) / downside if downside else float("nan")
+    running_max = -float("inf")
+    maxdd = 0.0
+    for e in eq:
+        running_max = max(running_max, e)
+        dd = e / running_max - 1
+        maxdd = min(maxdd, dd)
+    return dict(cagr=cagr, vol=vol, sharpe=sharpe, sortino=sortino, maxdd=maxdd,
+                final=eq[-1], n=n, dates=dates)
+
+
+def year_returns(returns_by_date):
+    by_year = {}
+    for d, r in returns_by_date:
+        by_year.setdefault(d.year, []).append(r)
+    out = {}
+    for y, rs in by_year.items():
+        acc = 1.0
+        for r in rs:
+            acc *= (1 + r)
+        out[y] = acc - 1
+    return out
+
+
+def main():
+    dates, data = load_closes()
+
+    labels, series = resample_month_end(dates, data, ALL)
+    r1m = {s: pct_change(series[s]) for s in ALL}
+    sig = {s: momentum_12m(series[s], LOOKBACK_M) for s in ALL}
+
+    sleeve_a = run_sleeve_a(labels, r1m, sig)
+    sleeve_b = [(t1, r1m["SPY"][labels.index(t1)]) for t1, _ in sleeve_a]
+
+    m_a = metrics(sleeve_a)
+    m_b = metrics(sleeve_b)
+    print(f"\nSanity check — Sleeve A (R8 top-2 reproduction): CAGR {m_a['cagr']:.2%} "
+          f"maxDD {m_a['maxdd']:.2%}  (R8 published: CAGR 16.69%, maxDD -17.11% at 5bps/side)")
+    print(f"Sanity check — Sleeve B (SPY B&H): CAGR {m_b['cagr']:.2%} "
+          f"Sortino {m_b['sortino']:.2f} maxDD {m_b['maxdd']:.2%}")
+
+    rows = []
+    for w in BLEND_WEIGHTS:
+        blend_ret = run_blend(sleeve_a, sleeve_b, w)
+        m = metrics(blend_ret)
+        yr = year_returns(blend_ret)
+        rows.append((w, m, yr))
+
+    yr_spy = year_returns(sleeve_b)
+
+    print(f"\n{'w(top2)':>7s} {'CAGR':>8s} {'Vol':>8s} {'Sharpe':>7s} {'Sortino':>8s} "
+          f"{'maxDD':>8s} {'$1->':>8s}   n / window")
+    for w, m, yr in rows:
+        print(f"{w:6.0%} {m['cagr']:8.2%} {m['vol']:8.2%} {m['sharpe']:7.2f} "
+              f"{m['sortino']:8.2f} {m['maxdd']:8.2%} {m['final']:7.2f}x   "
+              f"n={m['n']}  {m['dates'][0]}->{m['dates'][-1]}")
+
+    print(f"\n[SPY same-window] CAGR {m_b['cagr']:.2%}  Sharpe {m_b['sharpe']:.2f}  "
+          f"Sortino {m_b['sortino']:.2f}  maxDD {m_b['maxdd']:.2%}")
+
+    print("\nPre-declared bars vs SPY (Sharpe>=, Sortino>=, maxDD shallower, "
+          "corrected CAGR bar: CAGR>=SPY and delta<=3.0pt):")
+    bar_rows = {}
+    for w, m, yr in rows:
+        bar_sharpe = m["sharpe"] >= m_b["sharpe"]
+        bar_sortino = m["sortino"] >= m_b["sortino"]
+        bar_maxdd = m["maxdd"] > m_b["maxdd"]
+        cagr_delta = m["cagr"] - m_b["cagr"]
+        bar_cagr = (cagr_delta >= 0) and (cagr_delta <= 0.03)
+        n_clear = sum([bar_sharpe, bar_sortino, bar_maxdd, bar_cagr])
+        bar_rows[w] = dict(sharpe=bar_sharpe, sortino=bar_sortino, maxdd=bar_maxdd,
+                            cagr=bar_cagr, n_clear=n_clear, m=m)
+        print(f"  w={w:.0%}: Sharpe={'Y' if bar_sharpe else 'n'} Sortino={'Y' if bar_sortino else 'n'} "
+              f"maxDD={'Y' if bar_maxdd else 'n'} CAGR-corrected={'Y' if bar_cagr else 'n'}  "
+              f"({n_clear}/4)  CAGRdelta={cagr_delta:+.2%}")
+
+    ref = bar_rows.get(0.75)
+    if ref is not None:
+        print("\nDominance check vs w=75% (R20's coarse-grid best point):")
+        for w, m, yr in rows:
+            if w == 0.75:
+                continue
+            better_or_tie = 0
+            strictly_better = 0
+            for key in ("sharpe", "sortino"):
+                if m[key] >= ref["m"][key]:
+                    better_or_tie += 1
+                if m[key] > ref["m"][key]:
+                    strictly_better += 1
+            if m["maxdd"] >= ref["m"]["maxdd"]:
+                better_or_tie += 1
+            if m["maxdd"] > ref["m"]["maxdd"]:
+                strictly_better += 1
+            dominates = bar_rows[w]["n_clear"] == 4 and better_or_tie == 3 and strictly_better >= 2
+            print(f"  w={w:.0%}: Sharpe {'>' if m['sharpe']>ref['m']['sharpe'] else ('=' if m['sharpe']==ref['m']['sharpe'] else '<')} "
+                  f"Sortino {'>' if m['sortino']>ref['m']['sortino'] else ('=' if m['sortino']==ref['m']['sortino'] else '<')} "
+                  f"maxDD {'>' if m['maxdd']>ref['m']['maxdd'] else ('=' if m['maxdd']==ref['m']['maxdd'] else '<')}  "
+                  f"NEW_BEST={'YES' if dominates else 'no'}")
+
+    print("\n2022 return (blend vs SPY, same window):")
+    for w, m, yr in rows:
+        y22, y22s = yr.get(2022), yr_spy.get(2022)
+        y22_s = f"{y22:.2%}" if y22 is not None else "n/a"
+        y22s_s = f"{y22s:.2%}" if y22s is not None else "n/a"
+        beats = "n/a" if y22 is None else ("YES" if y22 > y22s else "no")
+        print(f"  w={w:.0%}: blend {y22_s:>8s} vs SPY {y22s_s:>8s}  beats_2022={beats}")
+
+    print("\nPer-year returns (blend | SPY same window):")
+    for w, m, yr in rows:
+        print(f"  w={w:.0%}:")
+        for y in sorted(yr.keys()):
+            print(f"    {y}: blend {yr[y]:7.2%}   spy {yr_spy[y]:7.2%}")
+
+
+if __name__ == "__main__":
+    main()
