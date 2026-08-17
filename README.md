@@ -1,5 +1,7 @@
 # trading
 
+[![CI](https://github.com/Khangaroooooo/trading/actions/workflows/ci.yml/badge.svg)](https://github.com/Khangaroooooo/trading/actions/workflows/ci.yml)
+
 A pre-registered backtesting log. 27 experiments (R1–R27) on US equities, paper account only,
 every one of them declaring its success criteria before it runs and getting written up either
 way — including the losers.
