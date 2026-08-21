@@ -520,7 +520,7 @@ Sanity checks passed exactly: Sleeve A reproduces R10/V2, Sleeve B reproduces R1
 
 ## #26 — First live paper deployment of the adopted strategy (2026-07-20)
 
-**What:** Deployed the program's standing recommendation — **R20 top-2 sector-rotation sleeve + SPY blend at w=75%** — into the Alpaca paper account (PA3PVULERXCA) at Khang's request, market open ~14:39 ET.
+**What:** Deployed the program's standing recommendation — **R20 top-2 sector-rotation sleeve + SPY blend at w=75%** — into the Alpaca paper account at Khang's request, market open ~14:39 ET.
 
 **Signal computed live (trailing 12-mo total return, current price ÷ dividend-adjusted close on 2025-07-18):** XLE +39.7%, XLK +36.4%, XLV +23.3%, XLI +19.3%, XLB +13.0%, XLRE +11.7%, XLU +10.2%, XLF +8.5%, XLP +7.5%, XLC +5.8%, XLY +4.1%; BIL +3.8%. **Top-2 = XLE, XLK**, both far above BIL → no cash substitution. Target blend = 37.5% XLE / 37.5% XLK / 25% SPY.
 
